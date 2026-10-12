@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "martin.job-queues",
+  "name": "Job Queues (martin)",
+  "version": "1.0.0",
+  "author": "martin",
+  "license": "MIT",
+  "description": "Sidekiq and Solid Queue of your Rails applications in the Omarchy bar: queues, failed, scheduled and recurring jobs on production and staging, with retry, delete and pause, read over SSH without adding anything to the applications",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Job Queues (martin)",
+    "description": "Sidekiq and Solid Queue on your servers: failed, queued and recurring jobs",
+    "category": "Development",
+    "aliases": [
+      "sidekiq",
+      "solid queue",
+      "jobs",
+      "queue",
+      "rails",
+      "kamal"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

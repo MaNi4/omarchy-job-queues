@@ -1,0 +1,1259 @@
+#!/usr/bin/env python3
+"""Feed for the martin.job-queues bar widget.
+
+Watches the Sidekiq and Solid Queue of your Rails projects in every
+environment they run in. Nothing is added to the applications: for each
+environment it pipes the scripts in ../remote into `bin/rails runner -` where the
+application runs (over SSH into the Kamal container, or into the local compose
+service), which answers with one line of JSON. The same script carries out the
+changes asked for from the panel.
+
+What there is to watch is read from the projects themselves, as listed in
+~/.config/omarchy/job-queues.json:
+
+  { "projects": [ { "path": "~/work/shop" } ] }
+
+The panel's Add project and Remove project buttons edit that list; nothing
+is looked for on its own. A project's backends are the sidekiq and
+solid_queue in its Gemfile.lock, and its environments are
+
+  development   the compose service that runs the jobs (else the app), when
+                the project has a compose file; entered only while it runs
+  the others    one per Kamal destination, config/deploy.<name>.yml merged
+                over config/deploy.yml; "production" when there are none
+
+so a project without a staging server simply has no staging. Nothing of a
+project is ever run on this machine unless its entry says so with a
+"development" command; code (ERB) in a Kamal config is stepped over, and
+what it stands for is asked for in the panel ("environment set" below) and
+kept in the project's entry: "staging": { "host": "203.0.113.8" }, with
+"user", "port", "service" and "role" alike. A project may override any of it:
+
+  { "name": "Shop", "path": "~/work/shop",
+    "backends": ["solid_queue"], "role": "job", "runner": "rails",
+    "development": false,
+    "environments": {
+      "staging": { "ssh": "deploy@203.0.113.8", "path": "/var/www/shop/current" },
+      "demo": { "ssh": "deploy@203.0.113.9", "kamal": { "service": "shop" } },
+      "legacy": { "command": "bin/rails runner -", "cwd": "~/work/legacy" } } }
+
+Nothing is changed anywhere unless you say so. Every environment is read-only
+except development, which is this machine. The panel can unlock one for a
+while ("writable on" below, with the environment's name typed out); that is
+kept in this process only, never in a file, so it ends with the time, with
+the process, or when the environment is reached some other way. For a
+read-only one the panel offers no actions, a change asked for anyway is
+refused here, and the script sent has the code that could make one cut out
+of it.
+
+How the script is run is found out too. Sidekiq only needs its gem and Redis,
+so it is first tried with `bundle exec ruby -`, a fraction of the cost of
+booting the application; where that does not answer (REDIS_URL not in the
+environment, Redis set up in an initializer) `bin/rails runner -` is used from
+then on. Solid Queue needs the application and always gets the latter.
+"runner": "rails" or "ruby" on a project settles it by hand.
+
+The servers are asked only when the panel asks: when it is opened, and on
+Refresh. With "interval": <seconds> (60 at least) in the config they are also
+asked on their own every so often, so that the icon follows them; each round
+boots the application once per environment, so it is off by default.
+
+One JSON line is printed whenever something changed. Lines on stdin drive it:
+
+  refresh              ask every environment now
+  project add          choose a directory and add it to "projects"
+  project remove <n>   take the project of that name off the list
+  refresh <id>         ask one, "project/environment"
+  writable on <id> <name>   allow changes there for a while; <name> is the
+                       environment's name as the user typed it
+  writable off <id>    read-only again
+  action <json>        {"id": ..., "backend": ..., "op": ..., ...}; see OPS ("id" is the
+                       environment, a job goes as "job")
+
+  omarchy-job-queues           run as the widget's feed
+  omarchy-job-queues --once    ask everything once, print, exit
+  omarchy-job-queues --list    print what was found, without asking anything
+"""
+import base64
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REMOTE = os.path.join(os.path.dirname(HERE), "remote")
+EXAMPLE = os.path.join(os.path.dirname(HERE), "job-queues.example.json")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                      "omarchy", "job-queues.json")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or ""
+SSH = "/usr/bin/ssh"
+SHELL = "/usr/share/omarchy/bin/omarchy-shell"
+PLUGIN = "martin.job-queues"
+UNLOCK = 30 * 60        # seconds an environment stays writable once unlocked
+MARK = "@@JOBQ@@"
+TIMEOUT = 120           # seconds one answer may take
+MAX_BYTES = 4 << 20     # most output read from one command
+INTERVAL = 0            # seconds between rounds on its own; 0 asks only on request
+RESCAN = 20             # seconds between looks at the projects' files
+MAX_LINE = 3000000      # longest line the panel is sent; it drops one past 4 MB
+MAX_PROJECTS = 24
+MAX_YAML = 1 << 20
+
+# What a backend's file fences its writing code with.
+CHANGES = re.compile(r"^[ \t]*# >>> changes.*?^[ \t]*# <<< changes[^\n]*\n", re.S | re.M)
+# SHA-256 of the scripts in ../remote this feed was written with: core.rb and
+# one file per backend, named after its gem. One that reads differently, or
+# is not listed here, is not sent anywhere; after a deliberate change put
+# what --checksum prints here. Listing a file is all it takes to add a backend.
+REMOTE_SHA256 = {
+    "core.rb": "d4f0fb14485ff6bdd03117c9b04f201311c91b9656c244f87c4b21784f795fd9",
+    "sidekiq.rb": "a67b8f967322503d44590b27f6bbe289fa333b2edadbb92ce963d50150833498",
+    "solid_queue.rb": "94081b9b1e6afb36727cfe9b0ea01e7418ca9a6bf3d66e942d4cd7e2f045f3e5",
+}
+BACKENDS = tuple(sorted(name[:-3] for name in REMOTE_SHA256 if name != "core.rb"))
+# What stands in a Kamal config where it has code (ERB) instead of a value.
+# The code is never run; what it would have said is asked for in the panel.
+UNKNOWN = "jobq-left-to-code"
+ERB_LINE = re.compile(r"^[ \t]*<%(?!=).*?%>[ \t]*\n", re.S | re.M)
+ERB = re.compile(r"<%.*?%>", re.S)
+# What reaching a Kamal deployment takes, and what each may look like.
+FIELDS = {
+    "host": (re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,253}$"), "the server's address"),
+    "user": (re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"), "the SSH user"),
+    "port": (re.compile(r"^[1-9][0-9]{0,4}$"), "the SSH port"),
+    "service": (re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"), "the service's name"),
+    "role": (re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"), "the role that runs the jobs"),
+    # These two a deployment may do without; see OPTIONAL.
+    "proxy": (re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_.-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9_.-]{0,253}(?::[1-9][0-9]{0,4})?$"),
+              "the jump host"),
+    "key": (re.compile(r"^[~/A-Za-z0-9_.][^\x00-\x1f\x7f]{0,254}$"), "the SSH key"),
+}
+# Asked for only where the Kamal config has them and leaves them to code.
+OPTIONAL = ("proxy", "key")
+# An environment in the config with one of these says everything itself;
+# without, it only fills in or replaces FIELDS of what the project says.
+WHOLE = ("ssh", "kamal", "path", "command", "compose")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:\[\]-]{0,254}$")
+COMPOSE = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+# The role, or compose service, that runs the jobs.
+JOBS = re.compile(r"sidekiq|solid_queue|bin/jobs")
+JOB_ROLES = ("job", "jobs", "worker", "workers", "sidekiq", "solid_queue")
+# What a panel may ask for, and the arguments each takes.
+OPS = {
+    "retry": ("list", "job"), "delete": ("list", "job"),
+    "retry_all": ("list",), "delete_all": ("list",),
+    "clear_queue": ("queue",), "pause_queue": ("queue",),
+    "cron_run": ("name",), "cron_toggle": ("name",),
+}
+
+out_lock = threading.Lock()
+
+
+class ConfigError(Exception):
+    pass
+
+
+def read_yaml(path, code=False):
+    """A YAML file as a dict. With `code`, ERB in it is stepped over, not run."""
+    try:
+        import yaml
+    except ImportError:
+        raise ConfigError("python-yaml is not installed")
+    with open(path, "rb") as f:
+        text = f.read(MAX_YAML).decode("utf-8", "replace")
+    if code:
+        text = ERB.sub(UNKNOWN, ERB_LINE.sub("", text))
+    data = yaml.safe_load(text)
+    return data if isinstance(data, dict) else {}
+
+
+def merge(base, over):
+    """Kamal's merge of a destination over the base: hashes deeply, the rest replaced."""
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+# ---------- Where the Ruby goes ----------
+
+RUNNERS = {"rails": "bin/rails runner -", "ruby": "bundle exec ruby -"}
+PATIENCE = TIMEOUT - 10     # seconds the far side gets, so that it ends before the wait for it does
+
+
+def guarded(runner):
+    """`runner` so that it cannot stay behind on the server.
+
+    Killing ssh here does not end a process inside a container there, so it
+    is given its own limit: by `timeout` where the image has one that takes
+    these arguments, and by the script itself (PATIENCE in core.rb) anyway.
+    """
+    return ("sh -c 'timeout -k 1 1 true >/dev/null 2>&1 && exec timeout -k 5 %d \"$@\"; exec \"$@\"' sh %s"
+            % (PATIENCE, runner))
+
+
+def kamal_command(service, role, destination, runner):
+    filters = ["label=service=" + service, "label=role=" + role]
+    if destination:
+        filters.append("label=destination=" + destination)
+    if not all(NAME.match(f.rsplit("=", 1)[1]) for f in filters):
+        raise ConfigError("kamal service, role and destination must be plain names")
+    find = "docker ps -q " + " ".join("--filter " + f for f in filters) + " | head -n1"
+    return ('c=$(%s); [ -n "$c" ] || { echo "No running %s container of %s"; exit 3; }; '
+            'exec docker exec -i "$c" %s' % (find, role, service, guarded(runner)))
+
+
+def remote_command(spec, env, runner):
+    """The shell command that reads Ruby on stdin where the application runs.
+
+    None when the spec has no say in how the Ruby is run and `runner` is not
+    the plain one, i.e. there is no light variant of it.
+    """
+    if isinstance(spec.get("command"), str) and spec["command"].strip():
+        return spec["command"] if runner == "rails" else None
+    if isinstance(spec.get("compose"), str) and NAME.match(spec["compose"]):
+        return "exec docker compose exec -T %s %s" % (spec["compose"], guarded(RUNNERS[runner]))
+    kamal = spec.get("kamal")
+    if isinstance(kamal, dict):
+        return kamal_command(str(kamal.get("service", "")), str(kamal.get("role", "web")),
+                             str(kamal.get("destination") or ""), RUNNERS[runner])
+    if isinstance(spec.get("path"), str) and spec["path"].startswith("/"):
+        rails_env = str(spec.get("env", env))
+        if not NAME.match(rails_env):
+            raise ConfigError("env must be a plain name")
+        return "cd -- %s && RAILS_ENV=%s exec %s" % (
+            shlex.quote(spec["path"]), rails_env, guarded(RUNNERS[runner].replace("bin/rails", "bundle exec rails")))
+    raise ConfigError('needs "kamal", "path" or "command"')
+
+
+def target_for(spec, env, runner="rails"):
+    """argv and cwd for one environment, from its spec; (None, None) without a light variant."""
+    command = remote_command(spec, env, runner)
+    if command is None:
+        return None, None
+    ssh = spec.get("ssh")
+    if not ssh:
+        cwd = spec.get("cwd")
+        return ["/bin/sh", "-c", command], os.path.expanduser(cwd) if isinstance(cwd, str) and cwd else None
+    if not isinstance(ssh, str) or not HOST.match(ssh):
+        raise ConfigError('"ssh" must look like user@host')
+    port = int(spec.get("port", 22))
+    if not 0 < port < 65536:
+        raise ConfigError("port out of range")
+    # As Kamal reaches it: through a jump host, with the keys it names.
+    how = []
+    proxy = spec.get("proxy")
+    if proxy:
+        if not isinstance(proxy, str) or not FIELDS["proxy"][0].match(proxy):
+            raise ConfigError('"proxy" must look like user@host')
+        how += ["-J", proxy]
+    keys = spec.get("keys") or []
+    for key in keys if isinstance(keys, list) else [keys]:
+        if not isinstance(key, str) or not FIELDS["key"][0].match(key):
+            raise ConfigError('"keys" must be paths')
+        how += ["-i", os.path.expanduser(key)]
+    if keys and spec.get("keys_only") is True:
+        how += ["-o", "IdentitiesOnly=yes"]
+    # One connection per host is kept for a minute, so a click in the panel
+    # does not pay for a new handshake. Its socket belongs in the user's own
+    # runtime directory, or nowhere.
+    shared = ["-o", "ControlMaster=auto", "-o", "ControlPersist=60",
+              "-o", "ControlPath=" + os.path.join(RUNTIME, "omarchy-job-queues-%C")] if RUNTIME else []
+    return [SSH, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"] + shared + how + [
+            "-p", str(port), "--", ssh, command], None
+
+
+# ---------- What a project says about itself ----------
+
+def backends_of(path):
+    try:
+        with open(os.path.join(path, "Gemfile.lock"), encoding="utf-8", errors="replace") as f:
+            lock = f.read(MAX_YAML)
+    except OSError:
+        return []
+    return [b for b in BACKENDS if re.search(r"^    %s \(" % b, lock, re.M)]
+
+
+def redis_in_initializer(path):
+    """Whether the project points Sidekiq at its Redis in code rather than through REDIS_URL."""
+    try:
+        with open(os.path.join(path, "config", "initializers", "sidekiq.rb"), encoding="utf-8", errors="replace") as f:
+            return bool(re.search(r"redis", f.read(MAX_YAML), re.I))
+    except OSError:
+        return False
+
+
+def compose_file(path):
+    return next((os.path.join(path, n) for n in COMPOSE if os.path.isfile(os.path.join(path, n))), None)
+
+
+def development_spec(path):
+    """How to reach the project on this machine, or None."""
+    compose = compose_file(path)
+    if compose:
+        services = read_yaml(compose).get("services")
+        services = services if isinstance(services, dict) else {}
+        built = [n for n, s in services.items() if isinstance(s, dict) and "build" in s and NAME.match(str(n))]
+        jobs = [n for n in built if JOBS.search(str(services[n].get("command", "")))]
+        named = [n for n in built if n in ("web", "app", "rails")]
+        pick = (jobs or named or built or [None])[0]
+        if pick:
+            return {"compose": pick, "cwd": path}
+    # Without one there is no telling how the project is run here, and its
+    # bin/rails is not something to start unasked.
+    return None
+
+
+def hosts_of(role):
+    hosts = role.get("hosts") if isinstance(role, dict) else role
+    out = []
+    for h in hosts if isinstance(hosts, list) else []:
+        h = next(iter(h), "") if isinstance(h, dict) else h
+        if isinstance(h, str) and h:
+            out.append(h)
+    return out
+
+
+def kamal_spec(config, destination, wanted_role, source):
+    """What one Kamal deployment's merged config says about reaching it.
+
+    "fields" has "" where the config leaves the value to code or does not
+    say; build_project asks for those.
+    """
+    servers = config.get("servers")
+    roles = servers if isinstance(servers, dict) else {"web": servers}
+    roles = {str(n): r for n, r in roles.items() if hosts_of(r) and UNKNOWN not in str(n)}
+    if wanted_role:
+        order = [wanted_role]
+    else:
+        by_cmd = [n for n, r in roles.items() if isinstance(r, dict) and JOBS.search(str(r.get("cmd", "")))]
+        order = by_cmd + [n for n in JOB_ROLES if n in roles] + ["web"] + list(roles)
+    role = next((n for n in order if n in roles), wanted_role or "")
+    ssh = config.get("ssh") if isinstance(config.get("ssh"), dict) else {}
+    # Kamal's jump host is root's unless it says whose; of its keys the first
+    # is the one that can be said by hand, the others go along as they are.
+    proxy = str(ssh.get("proxy") or "")
+    if proxy and "@" not in proxy and UNKNOWN not in proxy:
+        proxy = "root@" + proxy
+    keys = [str(k) for k in ssh["keys"]] if isinstance(ssh.get("keys"), list) else []
+    fields = {"host": hosts_of(roles[role])[0] if role in roles else "",
+              "user": str(ssh.get("user", "root")), "port": str(ssh.get("port", 22)),
+              "service": str(config.get("service", "")), "role": role,
+              "proxy": proxy, "key": keys[0] if keys else ""}
+    coded = [k for k, v in fields.items() if UNKNOWN in v]
+    fields = {k: "" if UNKNOWN in v else v.strip() for k, v in fields.items()}
+    return {"fields": fields, "found": dict(fields), "coded": coded, "destination": destination, "source": source,
+            "more_keys": [k for k in keys[1:] if UNKNOWN not in k], "keys_only": ssh.get("keys_only") is True}
+
+
+def kamal_environments(path, wanted_role):
+    """{ name: spec or ConfigError } for every Kamal destination of the project."""
+    base_file = os.path.join(path, "config", "deploy.yml")
+    if not os.path.isfile(base_file):
+        return {}
+    try:
+        base = read_yaml(base_file, code=True)
+    except Exception as e:
+        return {"production": ConfigError("config/deploy.yml: %s" % clip(str(e), 120))}
+    out = {}
+    for f in sorted(glob.glob(os.path.join(path, "config", "deploy.*.yml"))):
+        name = os.path.basename(f)[len("deploy."):-len(".yml")]
+        if not NAME.match(name) or name in ("example", "sample", "template"):
+            continue
+        try:
+            out[name] = dict(kamal_spec(merge(base, read_yaml(f, code=True)), name, wanted_role,
+                                        "config/" + os.path.basename(f)), root=path)
+        except Exception as e:
+            out[name] = ConfigError(clip(str(e), 160))
+    if not out and base.get("servers"):
+        try:
+            out["production"] = dict(kamal_spec(base, "", wanted_role, "config/deploy.yml"), root=path)
+        except Exception as e:
+            out["production"] = ConfigError(clip(str(e), 160))
+    return out
+
+
+def listed(words):
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def lacking(spec):
+    """The fields of a Kamal deployment that still have to be said by hand."""
+    fields = spec["fields"]
+    return [k for k in FIELDS if not fields[k] and (k not in OPTIONAL or k in spec["coded"])]
+
+
+def complete(spec):
+    """A Kamal deployment's spec with its fields made into what target_for reads.
+
+    Raises a ConfigError naming what is still not known, or does not look right.
+    """
+    fields = spec["fields"]
+    missing = lacking(spec)
+    if missing:
+        raise ConfigError("%s does not say %s. Fill it in to look at this environment." % (
+            spec["source"], listed([FIELDS[k][1] for k in missing])))
+    for k, (shape, what) in FIELDS.items():
+        if (fields[k] or k not in OPTIONAL) and not shape.match(fields[k]):
+            raise ConfigError("%s does not look right: %s" % (what.capitalize(), clip(fields[k], 60)))
+    # A key is named as Kamal reads it: from the project's directory.
+    keys = [k if k.startswith(("/", "~")) else os.path.join(spec.get("root") or "", k)
+            for k in [fields["key"]] + spec["more_keys"] if k]
+    return dict(spec, ssh="%s@%s" % (fields["user"], fields["host"]), port=fields["port"],
+                proxy=fields["proxy"], keys=keys,
+                kamal={"service": fields["service"], "role": fields["role"], "destination": spec["destination"]})
+
+
+def private(path):
+    """Take a file of the user's away from everybody else; it names servers."""
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def read_config():
+    """The config's JSON; no more of the file is read than a config can be."""
+    private(CONFIG)
+    with open(CONFIG, "rb") as f:
+        return json.loads(f.read(MAX_YAML).decode("utf-8"))
+
+
+def read_raw():
+    """The config as written, or an empty one."""
+    try:
+        raw = read_config()
+    except FileNotFoundError:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("not a JSON object")
+    if not isinstance(raw.get("projects"), list):
+        raw["projects"] = []
+    return raw
+
+
+def write_raw(raw):
+    """Replace the config, private to the user and never half written."""
+    os.makedirs(os.path.dirname(CONFIG), mode=0o700, exist_ok=True)
+    tmp = "%s.%d.tmp" % (CONFIG, os.getpid())
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(raw, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, CONFIG)
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def same_dir(a, b):
+    return os.path.realpath(os.path.expanduser(str(a))) == os.path.realpath(os.path.expanduser(str(b)))
+
+
+signals_lock = threading.Lock()
+signals = {"bus": None, "clicks": {}}
+
+
+def session_bus():
+    """The session bus, with one loop running for every signal waited for on it."""
+    from gi.repository import Gio, GLib
+    with signals_lock:
+        if signals["bus"] is None:
+            signals["bus"] = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
+        return signals["bus"]
+
+
+def choose(start, title, directory=True, wait=600):
+    """Ask for a directory, or a file, with the desktop's own chooser; None when cancelled."""
+    from gi.repository import Gio, GLib
+    bus = session_bus()
+    token = "jobq%d_%d" % (os.getpid(), int(time.time() * 1000) % 1000000)
+    request = "/org/freedesktop/portal/desktop/request/%s/%s" % (
+        bus.get_unique_name()[1:].replace(".", "_"), token)
+    done = threading.Event()
+    picked = []
+
+    def answered(_bus, _sender, _path, _iface, _signal, params):
+        code, results = params.unpack()
+        if code == 0 and results.get("uris"):
+            picked.append(results["uris"][0])
+        done.set()
+
+    PORTAL = "org.freedesktop.portal.Desktop"
+    sub = bus.signal_subscribe(PORTAL, "org.freedesktop.portal.Request", "Response", request, None,
+                               Gio.DBusSignalFlags.NONE, answered)
+    options = {"handle_token": GLib.Variant("s", token), "directory": GLib.Variant("b", directory),
+               "current_folder": GLib.Variant("ay", os.fsencode(start) + b"\0")}
+    try:
+        bus.call_sync(PORTAL, "/org/freedesktop/portal/desktop", "org.freedesktop.portal.FileChooser",
+                      "OpenFile", GLib.Variant("(ssa{sv})", ("", title, options)),
+                      None, Gio.DBusCallFlags.NONE, 10000, None)
+        if not done.wait(wait):
+            # Take the forgotten dialog down with us.
+            bus.call_sync(PORTAL, request, "org.freedesktop.portal.Request", "Close", None, None,
+                          Gio.DBusCallFlags.NONE, 2000, None)
+    finally:
+        bus.signal_unsubscribe(sub)
+    if not picked:
+        return None
+    path = urllib.parse.unquote(urllib.parse.urlparse(picked[0]).path)
+    return path if (os.path.isdir if directory else os.path.isfile)(path) else None
+
+
+def notify(body, clicked=None):
+    """A desktop notification, said over D-Bus so its text is in no command line.
+
+    `clicked` is called when the notification itself is.
+    """
+    NOTES = "org.freedesktop.Notifications"
+    try:
+        from gi.repository import Gio, GLib
+        bus = session_bus()
+        with signals_lock:
+            first = "sub" not in signals
+            signals["sub"] = True
+        if first:
+            def invoked(_bus, _sender, _path, _iface, _signal, params):
+                with signals_lock:
+                    then = signals["clicks"].pop(params.unpack()[0], None)
+                if then:
+                    then()
+
+            def closed(_bus, _sender, _path, _iface, _signal, params):
+                # After the click, if there was one; either way it is gone.
+                with signals_lock:
+                    signals["clicks"].pop(params.unpack()[0], None)
+
+            bus.signal_subscribe(NOTES, NOTES, "ActionInvoked", "/org/freedesktop/Notifications", None,
+                                 Gio.DBusSignalFlags.NONE, invoked)
+            bus.signal_subscribe(NOTES, NOTES, "NotificationClosed", "/org/freedesktop/Notifications", None,
+                                 Gio.DBusSignalFlags.NONE, closed)
+        # The body is read as markup by some; what it names is plain text.
+        text = clip(body, 240).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        sent = bus.call_sync(NOTES, "/org/freedesktop/Notifications", NOTES, "Notify",
+                             GLib.Variant("(susssasa{sv}i)", ("Job Queues", 0, "", "Job Queues", text,
+                                                              ["default", "Open"] if clicked else [], {}, 12000)),
+                             None, Gio.DBusCallFlags.NONE, 3000, None)
+        if clicked:
+            with signals_lock:
+                signals["clicks"][sent.unpack()[0]] = clicked
+                while len(signals["clicks"]) > 50:
+                    signals["clicks"].pop(next(iter(signals["clicks"])))
+    except Exception:
+        pass
+
+
+def env_order(name):
+    return (0 if name == "development" else 2 if name == "production" else 1, name)
+
+
+def build_project(entry, path):
+    """One project: its backends and a target per environment."""
+    name = str(entry.get("name") or (os.path.basename(path) if path else "Project"))[:40]
+    wanted = entry.get("backends")
+    backends = [b for b in wanted if b in BACKENDS] if isinstance(wanted, list) else []
+    if not backends and path:
+        backends = backends_of(path)
+    runner = entry.get("runner") if entry.get("runner") in RUNNERS else "auto"
+    if runner == "auto" and path and redis_in_initializer(path):
+        runner = "rails"    # the light way would talk to the wrong Redis
+    role = str(entry["role"]) if entry.get("role") else ""
+
+    specs = {}
+    if path:
+        specs.update(kamal_environments(path, role))
+        dev = entry.get("development")
+        if isinstance(dev, dict):
+            specs["development"] = dev
+        elif dev is not False:
+            try:
+                found = development_spec(path)
+            except Exception as e:
+                found = ConfigError(clip(str(e), 160))
+            if found:
+                specs["development"] = found
+    extra = entry.get("environments")
+    for env, given in (extra.items() if isinstance(extra, dict) else []):
+        env = str(env)
+        if not isinstance(given, dict) or not NAME.match(env):
+            continue
+        found = specs.get(env)
+        if isinstance(found, dict) and "fields" in found and not any(k in given for k in WHOLE):
+            # Said by hand what the Kamal config does not say, or says otherwise.
+            found["fields"].update({k: str(given[k]).strip() for k in FIELDS if str(given.get(k) or "").strip()})
+            found.update({k: given[k] for k in ("runner", "production") if k in given})
+        else:
+            specs[env] = given
+
+    envs = []
+    for env in sorted(specs, key=env_order):
+        spec = specs[env]
+        asked = isinstance(spec, dict) and "fields" in spec
+        target = {"id": "%s/%s" % (name, env), "name": env, "error": "", "argv": None, "cwd": None, "fast": None,
+                  # Of a Kamal deployment: what reaching it takes, as read and as it stands.
+                  "found": spec["found"] if asked else {}, "fields": dict(spec["fields"]) if asked else {},
+                  "missing": lacking(spec) if asked else [],
+                  "dev": env == "development", "backends": backends or ["auto"],
+                  # Anything else is unlocked from the panel, for a while; see Feed.unlock.
+                  "writable": env == "development",
+                  "production": env == "production" or (isinstance(spec, dict) and spec.get("production") is True)}
+        try:
+            if isinstance(spec, ConfigError):
+                raise spec
+            if asked:
+                spec = complete(spec)
+            mine = spec.get("runner") if spec.get("runner") in RUNNERS else runner
+            target["argv"], target["cwd"] = target_for(spec, env, "ruby" if mine == "ruby" else "rails")
+            if target["argv"] is None:
+                raise ConfigError('"runner": "ruby" needs "kamal" or "path", not "command"')
+            if mine == "auto" and "sidekiq" in backends:
+                target["fast"] = target_for(spec, env, "ruby")[0]
+        except (ConfigError, TypeError, ValueError) as e:
+            target["error"] = str(e)
+        envs.append(target)
+    note = ""
+    if not envs:
+        note = ("Nothing to look at here: no Kamal config (config/deploy.yml) and no compose file. "
+                "Pull a version that has one, or name an environment for it in the config.")
+    elif not backends:
+        note = "Neither sidekiq nor solid_queue in its Gemfile.lock; the application is asked which it uses."
+    return {"name": name, "path": path, "backends": backends, "envs": envs, "note": note}
+
+
+def load_config():
+    """(interval, projects) from the config and the projects it lists."""
+    raw = read_config()
+    if not isinstance(raw, dict):
+        raise ConfigError('expected { "projects": [ ... ] }')
+    try:
+        interval = int(raw.get("interval", INTERVAL))
+        interval = max(60, interval) if interval > 0 else 0
+    except (TypeError, ValueError):
+        interval = INTERVAL
+    entries = {}    # path or name -> (entry, path)
+    for entry in raw.get("projects") if isinstance(raw.get("projects"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        path = os.path.expanduser(entry["path"]) if isinstance(entry.get("path"), str) else None
+        entries[os.path.realpath(path) if path else "name:%s" % entry.get("name")] = (entry, path)
+    projects, seen = [], set()
+    for entry, path in list(entries.values())[:MAX_PROJECTS]:
+        project = build_project(entry, path)
+        if project["name"] not in seen:
+            seen.add(project["name"])
+            projects.append(project)
+    projects.sort(key=lambda p: p["name"].lower())
+    return interval, projects
+
+
+def signature():
+    """Changes whenever a file that decides the projects or environments does."""
+    paths = [CONFIG]
+    try:
+        raw = read_config()
+        dirs = [os.path.expanduser(p["path"]) for p in raw.get("projects") or []
+                if isinstance(p, dict) and isinstance(p.get("path"), str)]
+    except (OSError, ValueError, AttributeError, TypeError):
+        dirs = []
+    for d in dirs[:200]:
+        paths.append(os.path.join(d, "Gemfile.lock"))
+        paths.append(os.path.join(d, "config"))
+        paths += glob.glob(os.path.join(d, "config", "deploy*.yml"))
+        paths += [os.path.join(d, n) for n in COMPOSE]
+    out = []
+    for p in paths:
+        try:
+            out.append((p, os.stat(p).st_mtime))
+        except OSError:
+            pass
+    return out
+
+
+def clip(text, limit=300):
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def remote(name):
+    """One of the checked scripts in ../remote, as text."""
+    try:
+        with open(os.path.join(REMOTE, name), "rb") as f:
+            raw = f.read(MAX_BYTES)
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError("%s: %s" % (name, e))
+    if hashlib.sha256(raw).hexdigest() != REMOTE_SHA256.get(name):
+        raise ValueError("%s has changed since it was checked; nothing was sent" % name)
+    return text
+
+
+def compose(request, changing):
+    """The script for one request: core.rb, then the backend asked for.
+
+    Every backend goes along only when the application is to say which it
+    uses. Unless something is to be changed, each goes without the code
+    that could change anything.
+    """
+    wanted = request.get("backend")
+    parts = [remote("core.rb")]
+    for name in [wanted] if wanted in BACKENDS else BACKENDS:
+        part = remote(name + ".rb")
+        if not changing:
+            part, cuts = CHANGES.subn("", part)
+            if cuts != 1 or "op" in request:
+                raise ValueError("%s.rb: refusing to send a script that could change something" % name)
+        parts.append(part)
+    packed = base64.b64encode(json.dumps(request).encode()).decode()
+    return ('JOBQ_REQUEST = "%s"\n' % packed + "".join(parts) + "JobQ.answer\n").encode()
+
+
+def ask(target, request):
+    """Run the probe for one target; its answer, or { ok: False, error }.
+
+    "reached" tells whether the probe itself answered, as opposed to SSH,
+    docker or the application's boot failing before it could.
+    """
+    def failed(error, transport=False):
+        return {"ok": False, "error": error, "reached": False, "transport": transport}
+
+    try:
+        script = compose(request, "op" in request and target["writable"])
+    except ValueError as e:
+        return failed(str(e))
+    try:
+        proc = subprocess.Popen(target["argv"], cwd=target["cwd"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as e:
+        return failed(clip(str(e)))
+    got = bytearray()
+    why = ""
+    try:
+        # The script is far smaller than a pipe, so this cannot block.
+        proc.stdin.write(script)
+        proc.stdin.close()
+        deadline = time.time() + TIMEOUT
+        fd = proc.stdout.fileno()
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                why = "No answer within %d seconds" % TIMEOUT
+                break
+            if not select.select([fd], [], [], min(left, 5))[0]:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            got += chunk
+            if len(got) > MAX_BYTES:
+                why = "The answer was too long"
+                break
+    except OSError as e:
+        why = clip(str(e))
+    finally:
+        if proc.poll() is None:
+            if why:
+                proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        proc.stdout.close()
+    if why:
+        return failed(why, transport=True)
+    lines = got.decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
+        if line.startswith(MARK):
+            try:
+                answer = json.loads(line[len(MARK):])
+                if isinstance(answer, dict):
+                    answer["reached"] = True
+                    return answer
+            except ValueError:
+                pass
+            return failed("The answer could not be read")
+    # No answer: the last thing said is usually why (ssh, docker, bundler).
+    last = next((clip(l) for l in reversed(lines) if l.strip()), "")
+    # ssh keeps 255 for its own failures; anything else came from the far side.
+    return failed(last or "No answer (exit %s)" % proc.returncode,
+                  transport=target["argv"][0] == SSH and proc.returncode == 255)
+
+
+def slim(data, level):
+    """A backend's answer with less in it: 1 cuts the long texts, 2 leaves the rows out."""
+    lists = []
+    for one in data.get("lists") if isinstance(data.get("lists"), list) else []:
+        items = one.get("items") if isinstance(one, dict) and isinstance(one.get("items"), list) else []
+        rows = [] if level > 1 else [
+            dict(i, args=clip(str(i.get("args") or ""), 240), error=clip(str(i.get("error") or ""), 240))
+            for i in items if isinstance(i, dict)]
+        lists.append(dict(one, items=rows) if isinstance(one, dict) else one)
+    return dict(data, lists=lists)
+
+
+class Feed:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.error = ""
+        self.interval = INTERVAL
+        self.unlocked = {}      # id -> (argv then, until): writable for now; never written down
+        self.projects = []      # as built by load_config
+        self.targets = {}       # id -> target
+        self.states = {}        # id -> what the panel sees of it
+        self.gates = {}         # id -> one command at a time
+        self.busy = {}          # id -> commands running or waiting for that
+        self.seen = None        # signature() at the last load
+        self.message = None
+        self.quiet = False      # --once prints only the final state
+        self.choosing = False   # a file chooser is open
+        self.slow = set()       # ids where the light runner turned out not to work
+        self.serving = False    # the panel is listening; see serve
+        self.told = set()       # (id, what is missing) a notification was sent about
+
+    def reload(self):
+        """Look at the projects again if their files changed. True when they were rebuilt."""
+        now = signature()
+        if now == self.seen:
+            return False
+        try:
+            interval, projects = load_config()
+            error = "" if projects else "No projects yet"
+        except FileNotFoundError:
+            interval, projects, error = INTERVAL, [], "No job-queues.json yet"
+        except (OSError, ValueError, ConfigError) as e:
+            interval, projects, error = INTERVAL, [], "job-queues.json: %s" % e
+        targets = {t["id"]: t for p in projects for t in p["envs"]}
+        with self.lock:
+            self.seen = now
+            self.interval, self.projects, self.error = interval, projects, error
+            states = {}
+            for key, t in targets.items():
+                old, was = self.states.get(key), self.targets.get(key)
+                # What is known of an environment survives as long as it is
+                # still reached the same way.
+                if old and was and was["argv"] == t["argv"] and was["backends"] == t["backends"] and not t["error"]:
+                    states[key] = old
+                else:
+                    # Whatever still runs for the old one no longer counts.
+                    self.busy.pop(key, None)
+                    states[key] = {"ok": not t["error"], "error": t["error"], "loading": False,
+                                   "updated": 0, "data": {}}
+            self.targets, self.states = targets, states
+            self.settle()
+            self.gates = {k: self.gates.get(k) or threading.Lock() for k in targets}
+            self.busy = {k: n for k, n in self.busy.items() if k in targets}
+            self.slow &= set(states)
+            lacking = [(k, t) for k, t in targets.items() if t["missing"] and not t["dev"]]
+        # Said once per run: it is the panel that can do something about it.
+        for key, t in lacking if self.serving else []:
+            mark = (key, tuple(t["missing"]))
+            if mark not in self.told:
+                self.told.add(mark)
+                notify("%s: %s could not be read from the Kamal config. Click to fill it in." % (
+                    key.replace("/", " "), listed([FIELDS[k][1] for k in t["missing"]])),
+                       clicked=lambda key=key: self.show(key))
+        return True
+
+    def settle(self):
+        """Say on every target whether it may be changed now. Call with the lock held."""
+        now, changed = time.time(), False
+        for key, (argv, until) in list(self.unlocked.items()):
+            target = self.targets.get(key)
+            # Unlocked was that environment as it was reached then, until then.
+            if not target or tuple(target["argv"] or ()) != argv or until <= now:
+                del self.unlocked[key]
+                changed = True
+        for key, target in self.targets.items():
+            target["writable"] = target["dev"] or key in self.unlocked
+        return changed
+
+    def emit(self):
+        if self.quiet:
+            return
+        with self.lock:
+            # Whole at first; if that is more than the panel takes, with the
+            # long texts cut short, and then without the rows at all.
+            for level in (0, 1, 2):
+                line = self.line(level)
+                if len(line) <= MAX_LINE:
+                    break
+        with out_lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def line(self, level):
+        """The state as the panel reads it. Call with the lock held."""
+        projects = []
+        for p in self.projects:
+            envs = [dict(self.states[t["id"]], id=t["id"], name=t["name"],
+                         production=t["production"], dev=t["dev"], writable=t["writable"],
+                         fields=t["fields"], missing=t["missing"],
+                         until=int(self.unlocked[t["id"]][1]) if t["id"] in self.unlocked else 0)
+                    for t in p["envs"]]
+            known = p["backends"] or sorted({b for e in envs for b in e["data"]})
+            if level:
+                for e in envs:
+                    e["data"] = {b: slim(d, level) for b, d in e["data"].items()}
+            projects.append({"name": p["name"], "backends": known, "envs": envs, "note": p["note"]})
+        return json.dumps({"ok": not self.error, "error": self.error, "config": CONFIG,
+                           "example": EXAMPLE, "projects": projects, "message": self.message},
+                          ensure_ascii=False)
+
+    def ask_best(self, key, target, request):
+        """Ask the light way where that may work, the full way where it did not."""
+        if not target["fast"] or request["backend"] != "sidekiq" or key in self.slow:
+            return ask(target, request)
+        answer = ask(dict(target, argv=target["fast"]), request)
+        # Asking again is pointless when the server cannot be reached, and
+        # wrong when a change did run and merely failed.
+        if answer.get("ok") is True or answer.get("transport") or ("op" in request and answer["reached"]):
+            return answer
+        again = ask(target, request)
+        if again.get("ok") is True:
+            self.slow.add(key)
+        return again
+
+    def run(self, key, request=None):
+        """Ask one environment, optionally changing something first; then tell the panel."""
+        with self.lock:
+            target, state, gate = self.targets.get(key), self.states.get(key), self.gates.get(key)
+            if not target or target["error"]:
+                return
+            # A look is not queued behind one that is on its way: however
+            # often Refresh is pressed, the server is asked once at a time.
+            if request is None and self.busy.get(key):
+                return
+            self.busy[key] = self.busy.get(key, 0) + 1
+            state["loading"] = True
+        self.emit()
+        # A change goes to the backend it was made in; a round asks each.
+        backends = [request["backend"]] if request else target["backends"]
+        answers = []
+        with gate:
+            for backend in backends:
+                answer = self.ask_best(key, target, dict(request or {}, backend=backend))
+                answers.append((backend, answer))
+                if not answer["reached"]:
+                    break   # the next backend would wait for the same timeout
+        with self.lock:
+            # The projects may have been rebuilt while this was away.
+            if self.states.get(key) is not state:
+                return
+            self.busy[key] = max(0, self.busy.get(key, 0) - 1)
+            state["loading"] = self.busy[key] > 0
+            errors = [clip(str(a.get("error") or "Unknown error")) for _, a in answers if a.get("ok") is not True]
+            state["ok"], state["error"] = not errors, errors[0] if errors else ""
+            for backend, answer in answers:
+                if answer.get("ok") is True:
+                    name = answer.get("backend") if answer.get("backend") in BACKENDS else backend
+                    state["data"] = dict(state["data"], **{name: answer})
+                    state["updated"] = int(time.time())
+            if request:
+                text = clip(str(answers[0][1].get("message") or "Done")) if state["ok"] else state["error"]
+                self.message = {"id": key, "backend": request["backend"], "ok": state["ok"],
+                                "text": text, "ts": int(time.time()), "select": "", "env": "", "picked": None}
+        self.emit()
+
+    def start(self, key, request=None):
+        threading.Thread(target=self.run, args=(key, request), daemon=True).start()
+
+    def refresh(self, only=None):
+        with self.lock:
+            keys = list(self.targets)
+        for key in keys:
+            if only is None or only == key:
+                self.start(key)
+
+    def action(self, text):
+        try:
+            req = json.loads(text)
+            key, op, backend = req["id"], req["op"], req["backend"]
+            with self.lock:
+                self.settle()
+                target = self.targets.get(key)
+            if not target or backend not in BACKENDS:
+                return
+            if not target["writable"]:
+                self.say("%s is read-only; nothing was changed" % key.replace("/", " "), ok=False)
+                return
+            clean = {"op": op, "backend": backend}
+            for arg in OPS[op]:
+                value = req[arg]
+                if not isinstance(value, str) or not 0 < len(value) <= 200:
+                    return
+                # The script knows the job as "id"; here that is the environment.
+                clean["id" if arg == "job" else arg] = value
+        except (ValueError, KeyError, TypeError):
+            return
+        self.start(key, clean)
+
+    def say(self, text, ok=True, select="", env="", picked=None):
+        """Something to tell the panel that is not about one environment."""
+        with self.lock:
+            self.message = {"id": "", "backend": "", "ok": ok, "text": clip(text), "ts": int(time.time()),
+                            "select": select, "env": env, "picked": picked}
+        self.emit()
+
+    def reopen(self):
+        try:
+            subprocess.Popen([SHELL, PLUGIN, "open"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def key_choose(self, key):
+        """Let the SSH key of an environment be picked as a file; the panel's form takes it from there."""
+        if self.choosing:
+            return
+        self.choosing = True
+        path = ""
+        try:
+            home = os.path.expanduser("~")
+            start = os.path.join(home, ".ssh")
+            found = choose(start if os.path.isdir(start) else home, "Choose the SSH key", directory=False)
+            if found and FIELDS["key"][0].match(tilde(found)):
+                path = tilde(found)
+        except Exception as e:
+            self.say("Could not open the file chooser: %s" % e, ok=False)
+        finally:
+            self.choosing = False
+        # Cancelled or not, the panel stepped aside for the chooser and comes back.
+        self.say("", picked={"id": key, "key": path})
+        self.reopen()
+
+    def show(self, key):
+        """Open the panel on one environment."""
+        with self.lock:
+            target = self.targets.get(key)
+            project = next((p for p in self.projects if any(t is target for t in p["envs"])), None)
+        if not target or not project:
+            return
+        # Nothing to say: the environment shows what it lacks itself.
+        self.say("", select=project["name"], env=target["name"])
+        self.reopen()
+
+    def project_add(self):
+        if self.choosing:
+            return
+        self.choosing = True
+        try:
+            raw = read_raw()
+            # Beside the project added last, where the next one probably is.
+            near = [os.path.dirname(os.path.expanduser(e["path"]).rstrip("/")) for e in raw["projects"]
+                    if isinstance(e, dict) and isinstance(e.get("path"), str)]
+            start = next((d for d in reversed(near) if os.path.isdir(d)), os.path.expanduser("~"))
+            path = choose(start, "Choose a Rails project")
+            if not path:
+                return
+            raw = read_raw()    # it may have been edited while the chooser was open
+            name = os.path.basename(path.rstrip("/"))
+            listed = any(isinstance(e, dict) and e.get("path") and same_dir(e["path"], path) for e in raw["projects"])
+            if not listed:
+                raw["projects"].append({"path": tilde(path)})
+                write_raw(raw)
+            self.reload()
+            with self.lock:
+                found = next((p for p in self.projects if p["path"] and same_dir(p["path"], path)), None)
+            self.say(("%s is already listed" if listed else "Added %s") % name,
+                     select=found["name"] if found else "")
+        except Exception as e:
+            self.say("Could not add the project: %s" % e, ok=False)
+        finally:
+            self.choosing = False
+
+    def project_remove(self, name):
+        try:
+            with self.lock:
+                project = next((p for p in self.projects if p["name"] == name), None)
+            if not project:
+                return
+            raw = read_raw()
+            path = project["path"]
+            raw["projects"] = [e for e in raw["projects"] if not (
+                isinstance(e, dict) and ((path and e.get("path") and same_dir(e["path"], path))
+                                         or (not e.get("path") and e.get("name") == name)))]
+            write_raw(raw)
+            self.reload()
+            self.say("Removed %s from the list" % name)
+        except Exception as e:
+            self.say("Could not remove the project: %s" % e, ok=False)
+
+    def environment_set(self, text):
+        """Keep what the panel was told about reaching a Kamal deployment."""
+        try:
+            req = json.loads(text)
+            key = req["id"]
+            with self.lock:
+                target = self.targets.get(key)
+                project = next((p for p in self.projects if any(t is target for t in p["envs"])), None)
+            if not target or not project or not project["path"] or not target["fields"]:
+                return
+            where = key.replace("/", " ")
+            values = {}
+            for k, (shape, what) in FIELDS.items():
+                values[k] = req[k].strip() if isinstance(req.get(k), str) else ""
+                if (values[k] or k not in OPTIONAL) and not shape.match(values[k]):
+                    self.say("%s: %s does not look right; nothing was saved" % (where, what), ok=False)
+                    return
+            raw = read_raw()
+            entry = next((e for e in raw["projects"] if isinstance(e, dict) and isinstance(e.get("path"), str)
+                          and same_dir(e["path"], project["path"])), None)
+            if entry is None:
+                return
+            envs = entry["environments"] if isinstance(entry.get("environments"), dict) else {}
+            old = envs.get(target["name"]) if isinstance(envs.get(target["name"]), dict) else {}
+            # Only what the project's own files do not say, so they keep the say in the rest.
+            new = {k: v for k, v in old.items() if k not in FIELDS}
+            new.update({k: v for k, v in values.items() if v and v != target["found"].get(k)})
+            envs[target["name"]] = new
+            entry["environments"] = {k: v for k, v in envs.items() if v != {}}
+            if not entry["environments"]:
+                del entry["environments"]
+            write_raw(raw)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+        except (OSError, ConfigError) as e:
+            self.say("Could not save: %s" % e, ok=False)
+            return
+        self.reload()
+        self.say("%s: saved" % where)
+        self.start(key)
+
+    def unlock(self, key, typed):
+        """Allow changes in one environment for a while; its name has to be typed out."""
+        with self.lock:
+            target = self.targets.get(key)
+            if not target or target["dev"] or target["error"]:
+                return
+            if typed != target["name"]:
+                refused = True
+            else:
+                refused = False
+                self.unlocked[key] = (tuple(target["argv"] or ()), time.time() + UNLOCK)
+                self.settle()
+        where = key.replace("/", " ")
+        if refused:
+            self.say("%s stays read-only: its name was not typed" % where, ok=False)
+        else:
+            self.say("%s: changes are allowed for %d minutes" % (where, UNLOCK // 60))
+
+    def lock_again(self, key):
+        with self.lock:
+            had = self.unlocked.pop(key, None)
+            self.settle()
+        if had:
+            self.say("%s: read-only again" % key.replace("/", " "))
+
+    def serve(self):
+        self.serving = True
+        due = looked = 0
+        while True:
+            with self.lock:
+                ended = self.settle()
+            if ended:
+                self.say("Read-only again: the time is up")
+            if time.time() - looked >= RESCAN:
+                looked = time.time()
+                if self.reload():
+                    self.emit()
+                    due = 0
+            if self.interval and time.time() >= due:
+                self.refresh()
+                due = time.time() + self.interval
+            wait = min(3, due - time.time()) if self.interval else 3
+            ready, _, _ = select.select([sys.stdin], [], [], max(0.05, wait))
+            if not ready:
+                continue
+            line = sys.stdin.readline()
+            if not line:
+                return
+            word = line.strip()
+            if word == "refresh":
+                # Look at the projects again first.
+                looked = time.time()
+                if self.reload():
+                    self.emit()
+                self.refresh()
+                due = time.time() + self.interval
+            elif word.startswith("refresh "):
+                # The project's files may be what was just put right.
+                looked = time.time()
+                if self.reload():
+                    self.emit()
+                self.refresh(word[8:])
+            elif word.startswith("action "):
+                self.action(word[7:])
+            elif word.startswith("writable on "):
+                key, _, typed = word[12:].rpartition(" ")
+                self.unlock(key, typed)
+            elif word.startswith("writable off "):
+                self.lock_again(word[13:])
+            elif word.startswith("key choose "):
+                threading.Thread(target=self.key_choose, args=(word[11:],), daemon=True).start()
+            elif word == "project add":
+                threading.Thread(target=self.project_add, daemon=True).start()
+            elif word.startswith("environment set "):
+                self.environment_set(word[16:])
+                looked = time.time()
+            elif word.startswith("project remove "):
+                self.project_remove(word[15:])
+                looked = time.time()
+
+    def once(self):
+        self.reload()
+        with self.lock:
+            keys = list(self.targets)
+        threads = [threading.Thread(target=self.run, args=(k,)) for k in keys]
+        self.quiet = True
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.quiet = False
+        self.emit()
+
+    def listing(self):
+        self.reload()
+        if self.error:
+            print(self.error)
+        for p in self.projects:
+            print("%s  [%s]" % (p["name"], ", ".join(p["backends"]) or "backend asked from the application"))
+            for t in p["envs"]:
+                where = t["error"] or " ".join(shlex.quote(a) for a in t["argv"][-2:])
+                print("  %-12s %s%s%s" % (t["name"], "" if t["writable"] else "[read-only] ", where, "\n%15s(tried with bundle exec ruby first)" % "" if t["fast"] else ""))
+
+
+if __name__ == "__main__":
+    feed = Feed()
+    if "--checksum" in sys.argv:
+        for name in sorted(n for n in os.listdir(REMOTE) if n.endswith(".rb")):
+            with open(os.path.join(REMOTE, name), "rb") as f:
+                print('    "%s": "%s",' % (name, hashlib.sha256(f.read()).hexdigest()))
+    elif "--list" in sys.argv:
+        feed.listing()
+    elif "--once" in sys.argv:
+        feed.once()
+    else:
+        try:
+            feed.serve()
+        except KeyboardInterrupt:
+            pass
