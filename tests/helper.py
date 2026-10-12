@@ -1,4 +1,4 @@
-"""What the tests of bin/omarchy-job-queues share.
+"""What the tests of bin/job-queues share.
 
 Every test gets the feed loaded afresh with its config in a directory of its
 own, so nothing here reads or writes the real ~/.config/omarchy, and nothing
@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FEED = os.path.join(PLUGIN, "bin", "omarchy-job-queues")
+FEED = os.path.join(PLUGIN, "bin", "job-queues")
 
 KAMAL = """\
 service: shop

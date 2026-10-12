@@ -1,4 +1,4 @@
-# The shared part of what bin/omarchy-job-queues sends on stdin to
+# The shared part of what bin/job-queues sends on stdin to
 # `bin/rails runner -` (or `bundle exec ruby -`) on the server. Nothing of
 # this lives in the application.
 #

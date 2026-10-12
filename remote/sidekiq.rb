@@ -1,4 +1,4 @@
-# Sidekiq, as bin/omarchy-job-queues sends it after core.rb. It reads and
+# Sidekiq, as bin/job-queues sends it after core.rb. It reads and
 # changes Redis only; see core.rb for what a backend is.
 module JobQ
   module SidekiqBackend

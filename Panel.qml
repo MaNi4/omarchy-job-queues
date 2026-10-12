@@ -6,16 +6,16 @@ import qs.Ui
 import qs.Commons
 
 // Sidekiq and Solid Queue of the Rails applications in
-// ~/.config/omarchy/job-queues.json: what is queued, running, failed and
+// ~/.config/omarchy/extensions/job-queues.json: what is queued, running, failed and
 // scheduled, with retry, delete, pause and run-now. Fed by
-// bin/omarchy-job-queues, one long-lived process that asks each server over
+// bin/job-queues, one long-lived process that asks each server over
 // SSH. Service.qml owns that process; this widget exists once per monitor and
-// shows it. Styled like martin.rails-news: theme colours, stock qs.Ui parts.
+// shows it. Theme colours and stock qs.Ui parts throughout.
 Panel {
   id: root
 
-  moduleName: "martin.job-queues"
-  ipcTarget: "martin.job-queues"
+  moduleName: "mani4.job-queues"
+  ipcTarget: "mani4.job-queues"
 
   readonly property string ff: bar ? bar.fontFamily : Style.font.family
   readonly property color dimForeground: Qt.darker(barForeground, 1.4)

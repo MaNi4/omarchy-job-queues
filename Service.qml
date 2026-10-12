@@ -34,7 +34,7 @@ Item {
   Process {
     id: feed
     running: true
-    command: [service.pluginDir + "bin/omarchy-job-queues"]
+    command: [service.pluginDir + "bin/job-queues"]
     stdinEnabled: true
     stdout: SplitParser {
       onRead: function(line) {

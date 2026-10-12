@@ -1,11 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "martin.job-queues",
-  "name": "Job Queues (martin)",
+  "id": "mani4.job-queues",
+  "name": "Job Queues",
   "version": "1.0.0",
-  "author": "martin",
+  "author": "MaNi4",
   "license": "MIT",
-  "homepage": "https://github.com/MaNi4/omarchy-job-queues",
   "description": "Sidekiq and Solid Queue of your Rails applications in the Omarchy bar: queues, failed, scheduled and recurring jobs on production and staging, with retry, delete and pause, read over SSH without adding anything to the applications",
   "kinds": [
     "bar-widget",
@@ -15,8 +14,9 @@
     "barWidget": "Panel.qml",
     "service": "Service.qml"
   },
+  "homepage": "https://github.com/MaNi4/omarchy-job-queues",
   "barWidget": {
-    "displayName": "Job Queues (martin)",
+    "displayName": "Job Queues",
     "description": "Sidekiq and Solid Queue on your servers: failed, queued and recurring jobs",
     "category": "Development",
     "aliases": [

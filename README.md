@@ -1,8 +1,10 @@
-# Job Queues (martin)
+# Job Queues
 
-Sidekiq and Solid Queue of your Rails applications in the Omarchy bar: what is
-queued, running, failed, scheduled and recurring on production and staging,
-with retry, delete, pause and run-now.
+An Omarchy plugin that shows the Sidekiq and Solid Queue of your Rails
+applications in the bar: what is queued, running, failed, scheduled and
+recurring on production and staging, with retry, delete, pause and run-now.
+
+![Retries of a Sidekiq application, with their actions](preview.png)
 
 Nothing is added to the applications. For each environment the plugin opens an
 SSH connection and pipes the scripts in `remote/` into `bin/rails runner -` inside
@@ -11,19 +13,26 @@ out the changes asked for from the panel. Projects, their backends and their
 environments are read from the projects' own files, so a move from Sidekiq to
 Solid Queue, or a new staging server, needs no change here.
 
-The pictures show made-up projects and jobs.
+## Install
 
-| Sidekiq, an environment where changes are allowed | Sidekiq, read-only production |
-|---|---|
-| ![Retries with their actions](screenshots/retries.png) | ![Queues and workers, read-only](screenshots/read-only.png) |
+```
+omarchy plugin add https://github.com/MaNi4/omarchy-job-queues.git --enable
+```
 
-| Solid Queue, failed jobs | Solid Queue, recurring tasks |
-|---|---|
-| ![Failed jobs of a Solid Queue application](screenshots/solid-queue-failed.png) | ![Recurring tasks of a Solid Queue application](screenshots/solid-queue-cron.png) |
+Open the panel from the bar, press **Add project** and choose the directory of
+a Rails application. Its environments are found in its Kamal config.
 
-![A failed job unfolded: its arguments and the whole error](screenshots/unfolded.png)
+## Remove
 
-![Allowing changes: the environment's name has to be typed](screenshots/unlock.png)
+```
+omarchy plugin remove mani4.job-queues
+```
+
+Nothing of the plugin is on your servers, so there is nothing to remove there.
+The list of your projects stays in `~/.config/omarchy/extensions/job-queues.json`;
+delete that file if you do not want to keep it.
+
+## Usage
 
 - Click the icon for the panel; right-click to ask every server now. The
   servers are asked only then: when the panel opens, when you choose another
@@ -56,9 +65,25 @@ The pictures show made-up projects and jobs.
   deletes, `o` unfolds a job, `y` copies its error, `p` opens the project list, `a` adds a project, `e` next environment, `r` refreshes,
   `c` opens the config, Esc closes.
 
+## Screenshots
+
+The pictures show made-up projects and jobs.
+
+| Sidekiq, an environment where changes are allowed | Sidekiq, read-only production |
+|---|---|
+| ![Retries with their actions](screenshots/retries.png) | ![Queues and workers, read-only](screenshots/read-only.png) |
+
+| Solid Queue, failed jobs | Solid Queue, recurring tasks |
+|---|---|
+| ![Failed jobs of a Solid Queue application](screenshots/solid-queue-failed.png) | ![Recurring tasks of a Solid Queue application](screenshots/solid-queue-cron.png) |
+
+![A failed job unfolded: its arguments and the whole error](screenshots/unfolded.png)
+
+![Allowing changes: the environment's name has to be typed](screenshots/unlock.png)
+
 ## Projects
 
-`~/.config/omarchy/job-queues.json` lists them; **Add project** and **Remove
+`~/.config/omarchy/extensions/job-queues.json` lists them; **Add project** and **Remove
 project** edit it, and the **Config** button opens it (a missing file starts
 as `job-queues.example.json`). Nothing is looked for on its own.
 
@@ -84,7 +109,7 @@ and its environments come from the project too:
   keys to use (`ssh.keys`, `ssh.keys_only`).
 
 So a project without a staging server has no staging, and one that gets a new
-destination shows it within half a minute; `omarchy-job-queues --list` prints
+destination shows it within half a minute; `bin/job-queues --list` prints
 what was found without connecting anywhere.
 
 Kamal lets a config work its values out with code (ERB). That code is not run
@@ -176,7 +201,7 @@ The feed also carries the SHA-256 of each script in `remote/` it was written
 with and sends nothing when one reads differently, so a script changed by
 accident, or by something that did not know to change both, stays on this
 machine. After changing one on purpose, put what
-`omarchy-job-queues --checksum` prints into `REMOTE_SHA256` in the feed.
+`bin/job-queues --checksum` prints into `REMOTE_SHA256` in the feed.
 
 What this cannot cover is the machine itself: whoever can rewrite the
 plugin's files, or use your SSH key, can do on the server what you can. That
@@ -203,8 +228,13 @@ Another backend is a file of its own beside them, named after its gem
 (`good_job.rb`): a module that answers to the handful of methods described at
 the top of `core.rb`. The name is what is looked for in `Gemfile.lock`, and
 what the panel shows it under ("Good Job"). The one thing to do besides is to
-add the line `omarchy-job-queues --checksum` prints for it to `REMOTE_SHA256`
+add the line `bin/job-queues --checksum` prints for it to `REMOTE_SHA256`
 in the feed; a script that is not listed there is never sent.
+
+## Requirements
+
+`ssh`, and Python with PyYAML and PyGObject (`python-yaml`, `python-gobject`),
+all part of a stock Omarchy. On the servers nothing but what Kamal needs.
 
 ## Tests
 
@@ -214,7 +244,6 @@ Python and Ruby, keep to a temporary directory instead of your config, and
 connect nowhere. One of them fails when a script in `remote/` no longer
 matches its checksum, so a change there cannot be forgotten.
 
-## Requirements
+## License
 
-`ssh`, and Python with PyYAML and PyGObject (`python-yaml`, `python-gobject`),
-all part of a stock Omarchy. On the servers nothing but what Kamal needs.
+MIT

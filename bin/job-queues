@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Feed for the martin.job-queues bar widget.
+"""Feed for the mani4.job-queues bar widget.
 
 Watches the Sidekiq and Solid Queue of your Rails projects in every
 environment they run in. Nothing is added to the applications: for each
@@ -9,7 +9,7 @@ service), which answers with one line of JSON. The same script carries out the
 changes asked for from the panel.
 
 What there is to watch is read from the projects themselves, as listed in
-~/.config/omarchy/job-queues.json:
+~/.config/omarchy/extensions/job-queues.json:
 
   { "projects": [ { "path": "~/work/shop" } ] }
 
@@ -70,9 +70,9 @@ One JSON line is printed whenever something changed. Lines on stdin drive it:
   action <json>        {"id": ..., "backend": ..., "op": ..., ...}; see OPS ("id" is the
                        environment, a job goes as "job")
 
-  omarchy-job-queues           run as the widget's feed
-  omarchy-job-queues --once    ask everything once, print, exit
-  omarchy-job-queues --list    print what was found, without asking anything
+  job-queues                   run as the widget's feed
+  job-queues --once    ask everything once, print, exit
+  job-queues --list    print what was found, without asking anything
 """
 import base64
 import glob
@@ -92,11 +92,11 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 REMOTE = os.path.join(os.path.dirname(HERE), "remote")
 EXAMPLE = os.path.join(os.path.dirname(HERE), "job-queues.example.json")
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-                      "omarchy", "job-queues.json")
+                      "omarchy", "extensions", "job-queues.json")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or ""
 SSH = "/usr/bin/ssh"
 SHELL = "/usr/bin/omarchy-shell"
-PLUGIN = "martin.job-queues"
+PLUGIN = "mani4.job-queues"
 UNLOCK = 30 * 60        # seconds an environment stays writable once unlocked
 MARK = "@@JOBQ@@"
 TIMEOUT = 120           # seconds one answer may take
@@ -114,9 +114,9 @@ CHANGES = re.compile(r"^[ \t]*# >>> changes.*?^[ \t]*# <<< changes[^\n]*\n", re.
 # is not listed here, is not sent anywhere; after a deliberate change put
 # what --checksum prints here. Listing a file is all it takes to add a backend.
 REMOTE_SHA256 = {
-    "core.rb": "d4f0fb14485ff6bdd03117c9b04f201311c91b9656c244f87c4b21784f795fd9",
-    "sidekiq.rb": "a67b8f967322503d44590b27f6bbe289fa333b2edadbb92ce963d50150833498",
-    "solid_queue.rb": "94081b9b1e6afb36727cfe9b0ea01e7418ca9a6bf3d66e942d4cd7e2f045f3e5",
+    "core.rb": "e7c430233c59b4b71a8168e65385e916bb896777bfe9ac3ac57b8471977a05d2",
+    "sidekiq.rb": "8e17ec8a60ea77d9202f75fb3421107a22d75e2488c46b94a2b41ef5bb9cfadb",
+    "solid_queue.rb": "5757a21f4a1ad1a2f176f6d13ef07033b51925feb562d46abfdbbc98f163e15a",
 }
 BACKENDS = tuple(sorted(name[:-3] for name in REMOTE_SHA256 if name != "core.rb"))
 # What stands in a Kamal config where it has code (ERB) instead of a value.
@@ -267,7 +267,7 @@ def target_for(spec, env, runner="rails"):
     # does not pay for a new handshake. Its socket belongs in the user's own
     # runtime directory, or nowhere.
     shared = ["-o", "ControlMaster=auto", "-o", "ControlPersist=60",
-              "-o", "ControlPath=" + os.path.join(RUNTIME, "omarchy-job-queues-%C")] if RUNTIME else []
+              "-o", "ControlPath=" + os.path.join(RUNTIME, "job-queues-%C")] if RUNTIME else []
     return [SSH, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"] + shared + how + [
             "-p", str(port), "--", ssh, command], None

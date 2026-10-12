@@ -1,4 +1,4 @@
-# Solid Queue, as bin/omarchy-job-queues sends it after core.rb. Its jobs
+# Solid Queue, as bin/job-queues sends it after core.rb. Its jobs
 # are rows in the application's database; see core.rb for what a backend is.
 module JobQ
   module SolidQueueBackend
