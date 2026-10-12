@@ -115,8 +115,8 @@ CHANGES = re.compile(r"^[ \t]*# >>> changes.*?^[ \t]*# <<< changes[^\n]*\n", re.
 # what --checksum prints here. Listing a file is all it takes to add a backend.
 REMOTE_SHA256 = {
     "core.rb": "e7c430233c59b4b71a8168e65385e916bb896777bfe9ac3ac57b8471977a05d2",
-    "sidekiq.rb": "8e17ec8a60ea77d9202f75fb3421107a22d75e2488c46b94a2b41ef5bb9cfadb",
-    "solid_queue.rb": "5757a21f4a1ad1a2f176f6d13ef07033b51925feb562d46abfdbbc98f163e15a",
+    "sidekiq.rb": "84147a23e01e184f9425dd15529e599d82b5ba36faa01220524330de6b822a8e",
+    "solid_queue.rb": "23b786d6ef35da0535fe378730372732db148ea9d67ccdde9dc135a23c37ce8a",
 }
 BACKENDS = tuple(sorted(name[:-3] for name in REMOTE_SHA256 if name != "core.rb"))
 # What stands in a Kamal config where it has code (ERB) instead of a value.

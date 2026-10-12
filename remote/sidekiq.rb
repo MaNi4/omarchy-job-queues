@@ -4,6 +4,16 @@ module JobQ
   module SidekiqBackend
     module_function
 
+    # What things are called here is what Sidekiq's own web interface (and
+    # sidekiq-cron's) calls them.
+    WORDS = {
+      stats: { enqueued: "Enqueued", busy: "Busy", scheduled: "Scheduled", retry: "Retries",
+               failed: "Dead", processes: "Processes" },
+      queues: "Queues", cron: "Cron", failed: "dead", size: "enqueued", latency: "latency",
+      retry: "Retry Now", run: "Add to queue", delete: "Delete", retry_all: "Retry All", delete_all: "Delete All",
+      clear: "Delete", pause: "Pause", resume: "Unpause", cron_run: "Enqueue Now", enable: "Enable", disable: "Disable"
+    }.freeze
+
     def present?
       !defined?(Sidekiq).nil?
     end
@@ -70,11 +80,11 @@ module JobQ
         q = Sidekiq::Queue.new(req["queue"].to_s)
         n = q.size
         q.clear
-        "Removed #{n} jobs from #{q.name}"
+        "Deleted #{q.name} with its #{n} jobs"
       when "cron_run"
         job = cron_job(req["name"])
         job.respond_to?(:enqueue!) ? job.enqueue! : job.enque!
-        "Queued #{job.name}"
+        "Enqueued #{job.name}"
       when "cron_toggle"
         job = cron_job(req["name"])
         if job.status == "enabled"
@@ -170,11 +180,12 @@ module JobQ
             beat: JobQ.epoch(p["beat"]) }
         },
         lists: [
-          { key: "busy", label: "Running", total: stats.workers_size, items: busy, actions: [] },
+          { key: "busy", label: "Busy", total: stats.workers_size, items: busy, actions: [] },
           list("retry", "Retries", false, %w[retry delete retry_all delete_all]),
-          list("dead", "Dead", true, %w[retry delete retry_all delete_all]),
-          list("scheduled", "Scheduled", false, %w[retry delete delete_all])
+          list("scheduled", "Scheduled", false, %w[retry delete delete_all]),
+          list("dead", "Dead", true, %w[retry delete retry_all delete_all])
         ],
+        words: WORDS,
         cron: cron_rows
       }
     end

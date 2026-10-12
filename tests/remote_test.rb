@@ -188,6 +188,23 @@ class CoreTest < Minitest::Test
   end
 end
 
+class WordsTest < Minitest::Test
+  def test_every_backend_names_the_same_things
+    words = REAL_BACKENDS.map { |name| JobQ::BACKENDS.fetch(name)::WORDS }
+    assert_equal words[0].keys.sort, words[1].keys.sort
+    assert_equal words[0][:stats].keys, words[1][:stats].keys
+    words.each { |w| w.each_value { |v| assert(v.is_a?(Hash) ? v.values.all?(String) : v.is_a?(String)) } }
+  end
+
+  def test_they_are_named_as_their_own_interfaces_name_them
+    sidekiq, solid = REAL_BACKENDS.map { |name| JobQ::BACKENDS.fetch(name)::WORDS }
+    assert_equal ["Retry Now", "Add to queue", "Delete All", "Enqueue Now", "Dead"],
+                 [sidekiq[:retry], sidekiq[:run], sidekiq[:delete_all], sidekiq[:cron_run], sidekiq[:stats][:failed]]
+    assert_equal ["Retry", "Run now", "Discard all", "Recurring tasks", "In progress"],
+                 [solid[:retry], solid[:run], solid[:delete_all], solid[:cron], solid[:stats][:busy]]
+  end
+end
+
 class ArgumentsTest < Minitest::Test
   def plain(value) = JobQ::SolidQueueBackend.plain(value)
 

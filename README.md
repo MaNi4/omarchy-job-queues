@@ -46,9 +46,14 @@ delete that file if you do not want to keep it.
 - **Add project** lists a project (you choose its directory), **Remove
   project** takes the chosen one off the list; neither touches the project
   itself.
-- Then the numbers and the tabs: **Queues** (and worker processes),
-  **Running**, **Retries**, **Dead** / **Failed**, **Scheduled**, **Blocked**
-  and **Cron** (sidekiq-cron or Solid Queue recurring tasks).
+- Then the numbers and the tabs, named as each gem's own interface names
+  them. For Sidekiq, as in its web interface: **Queues** (with the
+  processes), **Busy**, **Retries**, **Scheduled**, **Dead** and **Cron**
+  (sidekiq-cron), with **Retry Now**, **Add to queue**, **Delete**, **Retry
+  All**, **Delete All** and **Enqueue Now**. For Solid Queue, as in Mission
+  Control: **Queues**, **In progress**, **Failed**, **Scheduled**, **Blocked**
+  and **Recurring tasks**, with **Retry**, **Discard**, **Run now**, **Retry
+  all**, **Discard all**, **Pause** and **Resume**.
 - A job's arguments and error are cut short in the list. Click the job to
   unfold it and read them whole; **Copy error** under them puts the error on
   the clipboard.
@@ -57,13 +62,15 @@ delete that file if you do not want to keep it.
   changes** button at the bottom allows them for the environment you are
   looking at, for half an hour: it asks you to type the environment's name
   first. It then reads **Make read-only**, and a click does that at once; the
-  top right corner says which of the two the environment is in. Where changes are allowed, each row has its actions at the right
-  edge and **Retry all** / **Delete all** appear under a list that allows
-  them. Anything that throws jobs away asks first, and in production every
-  change does.
+  top right corner says which of the two the environment is in. Where
+  changes are allowed, each row has its actions at the right edge and the
+  ones for a whole list appear under it. Anything that throws jobs away asks
+  first, and in production every change does.
 - Keyboard: up/down move, left/right change tab, Enter retries or runs, `x`
-  deletes, `o` unfolds a job, `y` copies its error, `p` opens the project list, `a` adds a project, `e` next environment, `r` refreshes,
-  `c` opens the config, Esc closes.
+  deletes or discards, `o` unfolds a job, `y` copies its error, `p` opens the
+  project list, `a` adds a project, `e` next environment, `r` refreshes, `c`
+  opens the config, Esc closes.
+
 
 ## Screenshots
 
@@ -233,8 +240,57 @@ in the feed; a script that is not listed there is never sent.
 
 ## Requirements
 
-`ssh`, and Python with PyYAML and PyGObject (`python-yaml`, `python-gobject`),
-all part of a stock Omarchy. On the servers nothing but what Kamal needs.
+What has to be true for the plugin to show an application's jobs. Where one
+of these does not hold, the environment says so in the panel instead of
+showing anything.
+
+**The application**
+
+- A Rails application whose jobs run on **Sidekiq** (7 and 8 were tried, with
+  or without sidekiq-cron) or **Solid Queue** (1.7 was tried). Resque, Good
+  Job, Delayed Job and the like are not supported.
+- The gem is in its `Gemfile.lock`; that is how the backend is known.
+- `bin/rails` works in the place the jobs run in, and there is a `sh` there.
+
+**Production and staging**
+
+- Deployed with **Kamal**: `config/deploy.yml`, with `config/deploy.<name>.yml`
+  per destination if there are several. The host, SSH user and port, the
+  service and the role are read from there. A deployment without Kamal works
+  only when you describe the environment by hand (see Projects): a release
+  directory on a server, or any command that reads Ruby on stdin.
+- The container that runs the jobs is running, and Docker on the server
+  labels it as Kamal does (`service`, `role`, `destination`). The role taken
+  is the one whose command runs the jobs, else one named `job`, `jobs`,
+  `worker`, `workers`, `sidekiq` or `solid_queue`, else `web`.
+- You can `ssh` to the server from this machine **without being asked
+  anything**: the key is in an agent or has no passphrase, and the host is in
+  `known_hosts`. Passwords are not supported. A jump host (`ssh.proxy`) and
+  keys (`ssh.keys`) from the Kamal config are used; `ssh.proxy_command` and
+  `ssh.key_data` are not, but your own `~/.ssh/config` applies as always.
+- The SSH user may run `docker`, as Kamal itself needs.
+- For Sidekiq, Redis is reachable from the job container, which it is where
+  Sidekiq runs. Where the container has `REDIS_URL`, a look takes about a
+  second; where Redis is set up in an initializer, the application is booted
+  for it, which takes as long as `bin/rails runner` does.
+- For Solid Queue, the application is always booted, and its queue database
+  has to be reachable from the job container.
+
+**Development**
+
+- The project has a compose file (`compose.yaml` and its other spellings)
+  with a service that is built from the project, and that service is running.
+  Without one there is no development environment unless you give it a
+  command in the config.
+
+**This machine**
+
+- Omarchy with the Quickshell-based shell.
+- `ssh`, and Python with PyYAML and PyGObject (`python-yaml`,
+  `python-gobject`), all part of a stock Omarchy. `docker` only for
+  development environments.
+
+Nothing is installed on the servers and nothing is added to the application.
 
 ## Tests
 

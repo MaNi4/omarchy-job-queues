@@ -55,7 +55,7 @@ Panel {
     var names = (p.envs || []).map(function(e) { return e.name })
     return {
       value: p.name,
-      label: p.name + (failed > 0 ? "  ·  " + failed + " failed" : short ? "  ·  needs details" : lost ? "  ·  unreachable" : ""),
+      label: p.name + (failed > 0 ? "  ·  " + failed + " " + root.failedWord(p) : short ? "  ·  needs details" : lost ? "  ·  unreachable" : ""),
       description: kinds.concat(names.join(", ")).join("  ·  ")
     }
   })
@@ -143,12 +143,43 @@ Panel {
     return n
   }
 
+  // ---------- Words ----------
+  // Each backend names its things as its own interface does (Sidekiq's web
+  // interface, Mission Control for Solid Queue) and sends the names along;
+  // these stand in until it has answered.
+  readonly property var plainWords: ({
+    stats: { enqueued: "Enqueued", busy: "Busy", scheduled: "Scheduled", retry: "Retries", failed: "Failed", processes: "Processes" },
+    queues: "Queues", cron: "Cron", failed: "failed", size: "enqueued", latency: "latency",
+    retry: "Retry", run: "Run now", "delete": "Delete", retry_all: "Retry all", delete_all: "Delete all",
+    clear: "Clear", pause: "Pause", resume: "Resume", cron_run: "Run now", enable: "Enable", disable: "Disable"
+  })
+  readonly property var words: {
+    var given = info && info.words ? info.words : ({})
+    var out = {}
+    for (var k in plainWords) out[k] = typeof given[k] === typeof plainWords[k] && given[k] ? given[k] : plainWords[k]
+    return out
+  }
+  // The numbers at the top: only what the backend counts (Solid Queue has
+  // no retries of its own), under the backend's names.
+  readonly property var statModel: ["enqueued", "busy", "scheduled", "retry", "failed", "processes"].filter(function(key) {
+    return root.stats[key] !== null && root.stats[key] !== undefined
+  }).map(function(key) { return { key: key, label: String(root.words.stats[key] || root.plainWords.stats[key]) } })
+  // What a project's failed jobs are called: "dead" in Sidekiq, "failed" in Solid Queue.
+  function failedWord(p) {
+    var list = p ? p.envs || [] : []
+    for (var i = 0; i < list.length; i++) {
+      var data = list[i].data || ({})
+      for (var b in data) if (data[b] && data[b].words && typeof data[b].words.failed === "string") return data[b].words.failed
+    }
+    return plainWords.failed
+  }
+
   // ---------- Tabs ----------
   readonly property var tabs: {
-    var out = [{ key: "queues", label: "Queues", count: -1 }]
+    var out = [{ key: "queues", label: words.queues, count: -1 }]
     for (var i = 0; i < lists.length; i++)
       out.push({ key: "list:" + lists[i].key, label: lists[i].label, count: Number(lists[i].total || 0) })
-    out.push({ key: "cron", label: "Cron", count: info && info.cron ? info.cron.length : 0 })
+    out.push({ key: "cron", label: words.cron, count: info && info.cron ? info.cron.length : 0 })
     return out
   }
   property string tab: "queues"
@@ -194,15 +225,15 @@ Panel {
         var q = queues[i]
         var qa = []
         if (has(q.actions, "pause")) qa.push({
-          icon: q.paused ? "\u{f040a}" : "\u{f03e4}", tip: q.paused ? "Resume" : "Pause", danger: false,
+          icon: q.paused ? "\u{f040a}" : "\u{f03e4}", tip: q.paused ? words.resume : words.pause, danger: false,
           request: { op: "pause_queue", queue: q.name }, ask: "" })
         if (has(q.actions, "clear")) qa.push({
-          icon: "\u{f00e2}", tip: "Remove every job", danger: true,
+          icon: "\u{f00e2}", tip: words.clear, danger: true,
           request: { op: "clear_queue", queue: q.name },
-          ask: "Remove all " + q.size + " jobs waiting in " + q.name + "?" })
+          ask: words.clear + " " + q.name + " with its " + q.size + " job" + (q.size === 1 ? "" : "s") + "?" })
         out.push({
           title: q.name + (q.paused ? "  ·  paused" : ""),
-          sub: q.size + " waiting" + (q.latency !== null && q.size > 0 ? "  ·  oldest " + seconds(q.latency) : ""),
+          sub: q.size + " " + words.size + (q.latency !== null && q.size > 0 ? "  ·  " + words.latency + " " + seconds(q.latency) : ""),
           error: "", dim: false, actions: qa })
       }
       var procs = info.processes || []
@@ -222,10 +253,10 @@ Panel {
         var c = cron[i]
         var ca = []
         if (has(c.actions, "run")) ca.push({
-          icon: "\u{f040a}", tip: "Run now", danger: false,
+          icon: "\u{f040a}", tip: words.cron_run, danger: false,
           request: { op: "cron_run", name: c.name }, ask: "" })
         if (has(c.actions, "toggle")) ca.push({
-          icon: c.enabled ? "\u{f03e4}" : "\u{f0459}", tip: c.enabled ? "Disable" : "Enable", danger: false,
+          icon: c.enabled ? "\u{f03e4}" : "\u{f0459}", tip: c.enabled ? words.disable : words.enable, danger: false,
           request: { op: "cron_toggle", name: c.name }, ask: "" })
         out.push({
           title: c.name + (c.enabled ? "" : "  ·  disabled"),
@@ -240,11 +271,11 @@ Panel {
         var j = items[i]
         var ja = []
         if (has(currentList.actions, "retry")) ja.push({
-          icon: "\u{f0459}", tip: key === "scheduled" ? "Run now" : "Retry", danger: false,
+          icon: "\u{f0459}", tip: key === "scheduled" ? words.run : words.retry, danger: false,
           request: { op: "retry", list: key, job: j.id }, ask: "" })
         if (has(currentList.actions, "delete")) ja.push({
-          icon: "\u{f01b4}", tip: "Delete", danger: true,
-          request: { op: "delete", list: key, job: j.id }, ask: "Delete " + j.cls + "?" })
+          icon: "\u{f01b4}", tip: words.delete, danger: true,
+          request: { op: "delete", list: key, job: j.id }, ask: words.delete + " " + j.cls + "?" })
         var meta = [j.queue]
         if (j.at) meta.push(timeAgo(j.at))
         if (j.tries) meta.push(j.tries + " tries")
@@ -264,13 +295,13 @@ Panel {
     var out = []
     if (!writable || !currentList || !Number(currentList.total)) return out
     var n = currentList.total
-    var what = n + " " + String(currentList.label).toLowerCase() + " job" + (n === 1 ? "" : "s")
+    var what = n + " job" + (n === 1 ? "" : "s") + " in " + currentList.label
     if (has(currentList.actions, "retry_all")) out.push({
-      key: "retry_all", label: "Retry all", icon: "\u{f0459}",
-      request: { op: "retry_all", list: currentList.key }, ask: "Retry all " + what + "?" })
+      key: "retry_all", label: words.retry_all, icon: "\u{f0459}", confirm: words.retry_all,
+      request: { op: "retry_all", list: currentList.key }, ask: words.retry_all + ": " + what + "?" })
     if (has(currentList.actions, "delete_all")) out.push({
-      key: "delete_all", label: "Delete all", icon: "\u{f01b4}",
-      request: { op: "delete_all", list: currentList.key }, ask: "Delete all " + what + "?" })
+      key: "delete_all", label: words.delete_all, icon: "\u{f01b4}", danger: true,
+      request: { op: "delete_all", list: currentList.key }, ask: words.delete_all + ": " + what + "?" })
     return out
   }
 
@@ -341,7 +372,7 @@ Panel {
     var question = action.ask || (target.production ? action.tip + "?" : "")
     if (question === "") { service.act(req); return }
     pending = { request: req, ask: question + "\n" + project.name + " " + target.name,
-                confirm: action.danger ? "Delete" : "Yes" }
+                confirm: action.danger ? (action.tip || action.label || words.delete) : "Yes" }
     confirm.selectedIndex = 0
   }
 
@@ -548,7 +579,7 @@ Panel {
         var p = root.projects[i]
         var failed = root.failedInProject(p, "")
         var lost = (p.envs || []).filter(root.down).map(function(e) { return e.name })
-        if (failed > 0) parts.push(p.name + " " + failed + " failed")
+        if (failed > 0) parts.push(p.name + " " + failed + " " + root.failedWord(p))
         if (lost.length) parts.push(p.name + " " + lost.join(", ") + " unreachable")
       }
       return "Job Queues · " + (parts.length ? parts.join(" · ") : "click to look")
@@ -895,17 +926,10 @@ Panel {
           width: parent.width
 
           Repeater {
-            model: [
-              { label: "Queued", key: "enqueued" },
-              { label: "Running", key: "busy" },
-              { label: "Scheduled", key: "scheduled" },
-              { label: "Retries", key: "retry" },
-              { label: "Failed", key: "failed" },
-              { label: "Workers", key: "processes" }
-            ]
+            model: root.statModel
             Stat {
               required property var modelData
-              width: statRow.width / 6
+              width: statRow.width / Math.max(1, root.statModel.length)
               label: modelData.label
               value: root.stats[modelData.key]
               alarm: (modelData.key === "failed" && Number(value) > 0) || (modelData.key === "processes" && Number(value) === 0)
@@ -1276,7 +1300,7 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              text: "Retry, delete, pause and run-now will work from this panel for half an hour, "
+              text: "Jobs and queues can be changed from this panel for half an hour, "
                   + "or until you switch it back."
               color: root.dimForeground
               font.family: root.ff

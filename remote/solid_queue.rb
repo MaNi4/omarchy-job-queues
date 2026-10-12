@@ -4,6 +4,16 @@ module JobQ
   module SolidQueueBackend
     module_function
 
+    # Solid Queue has no interface of its own; what things are called here is
+    # what Mission Control - Jobs, Rails' interface for it, calls them.
+    WORDS = {
+      stats: { enqueued: "Pending", busy: "In progress", scheduled: "Scheduled", retry: "Retries",
+               failed: "Failed", processes: "Processes" },
+      queues: "Queues", cron: "Recurring tasks", failed: "failed", size: "pending", latency: "latency",
+      retry: "Retry", run: "Run now", delete: "Discard", retry_all: "Retry all", delete_all: "Discard all",
+      clear: "Clear", pause: "Pause", resume: "Resume", cron_run: "Run now", enable: "Enable", disable: "Disable"
+    }.freeze
+
     def present?
       !defined?(SolidQueue).nil?
     end
@@ -87,7 +97,7 @@ module JobQ
       when "delete"
         j = job(req)
         j.discard
-        "Deleted #{j.class_name}"
+        "Discarded #{j.class_name}"
       when "retry_all"
         raise ArgumentError, "unknown list" unless req["list"] == "failed"
         n = SolidQueue::FailedExecution.count
@@ -101,12 +111,12 @@ module JobQ
                 end
         n = scope.count
         scope.discard_all_in_batches
-        "Deleted #{n} jobs"
+        "Discarded #{n} jobs"
       when "clear_queue"
         q = SolidQueue::Queue.find_by_name(req["queue"].to_s)
         n = q.size
         q.clear
-        "Removed #{n} jobs from #{q.name}"
+        "Cleared #{q.name}: #{n} jobs discarded"
       when "pause_queue"
         q = SolidQueue::Queue.find_by_name(req["queue"].to_s)
         if q.paused?
@@ -194,14 +204,15 @@ module JobQ
             concurrency: meta["thread_pool_size"], queues: meta["queues"].to_s, beat: JobQ.epoch(p.last_heartbeat_at) }
         },
         lists: [
-          { key: "busy", label: "Running", total: counts[:busy], items: running, actions: [] },
+          { key: "busy", label: "In progress", total: counts[:busy], items: running, actions: [] },
           { key: "failed", label: "Failed", total: counts[:failed], items: failed,
             actions: %w[retry delete retry_all delete_all] },
           { key: "scheduled", label: "Scheduled", total: counts[:scheduled], items: scheduled,
             actions: %w[retry delete delete_all] },
           { key: "blocked", label: "Blocked", total: counts[:blocked], items: blocked, actions: %w[delete] }
         ],
-        cron: cron_rows
+        cron: cron_rows,
+        words: WORDS
       }
     end
   end
