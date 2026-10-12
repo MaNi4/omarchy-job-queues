@@ -95,7 +95,7 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~
                       "omarchy", "job-queues.json")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or ""
 SSH = "/usr/bin/ssh"
-SHELL = "/usr/share/omarchy/bin/omarchy-shell"
+SHELL = "/usr/bin/omarchy-shell"
 PLUGIN = "martin.job-queues"
 UNLOCK = 30 * 60        # seconds an environment stays writable once unlocked
 MARK = "@@JOBQ@@"
@@ -1020,10 +1020,16 @@ class Feed:
 
     def reopen(self):
         try:
-            subprocess.Popen([SHELL, PLUGIN, "open"], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait(timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            proc = subprocess.Popen([SHELL, PLUGIN, "open"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Given up on, so not left behind either.
+            proc.kill()
+            proc.wait()
 
     def key_choose(self, key):
         """Let the SSH key of an environment be picked as a file; the panel's form takes it from there."""
