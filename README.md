@@ -91,7 +91,9 @@ Kamal lets a config work its values out with code (ERB). That code is not run
 here, so a server's address, SSH user, port, service, role, jump host or key
 written that way cannot be read. The environment then says what it lacks, a notification says
 so once, and **Fill in** asks for it; what you type is kept in the project's
-entry and the rest is still read from the project:
+entry and the rest is still read from the project. An environment that was
+read whole but does not answer offers the same form as **Edit connection**,
+for the case that what the project says is not how you reach it:
 
 ![Filling in what a Kamal config leaves to code](screenshots/fill-in.png)
 

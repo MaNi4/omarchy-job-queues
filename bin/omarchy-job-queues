@@ -565,18 +565,8 @@ def env_order(name):
     return (0 if name == "development" else 2 if name == "production" else 1, name)
 
 
-def build_project(entry, path):
-    """One project: its backends and a target per environment."""
-    name = str(entry.get("name") or (os.path.basename(path) if path else "Project"))[:40]
-    wanted = entry.get("backends")
-    backends = [b for b in wanted if b in BACKENDS] if isinstance(wanted, list) else []
-    if not backends and path:
-        backends = backends_of(path)
-    runner = entry.get("runner") if entry.get("runner") in RUNNERS else "auto"
-    if runner == "auto" and path and redis_in_initializer(path):
-        runner = "rails"    # the light way would talk to the wrong Redis
-    role = str(entry["role"]) if entry.get("role") else ""
-
+def environment_specs(entry, path, role):
+    """{ name: spec or ConfigError }: what the project says, then what its entry says."""
     specs = {}
     if path:
         specs.update(kamal_environments(path, role))
@@ -602,33 +592,48 @@ def build_project(entry, path):
             found.update({k: given[k] for k in ("runner", "production") if k in given})
         else:
             specs[env] = given
+    return specs
 
-    envs = []
-    for env in sorted(specs, key=env_order):
-        spec = specs[env]
-        asked = isinstance(spec, dict) and "fields" in spec
-        target = {"id": "%s/%s" % (name, env), "name": env, "error": "", "argv": None, "cwd": None, "fast": None,
-                  # Of a Kamal deployment: what reaching it takes, as read and as it stands.
-                  "found": spec["found"] if asked else {}, "fields": dict(spec["fields"]) if asked else {},
-                  "missing": lacking(spec) if asked else [],
-                  "dev": env == "development", "backends": backends or ["auto"],
-                  # Anything else is unlocked from the panel, for a while; see Feed.unlock.
-                  "writable": env == "development",
-                  "production": env == "production" or (isinstance(spec, dict) and spec.get("production") is True)}
-        try:
-            if isinstance(spec, ConfigError):
-                raise spec
-            if asked:
-                spec = complete(spec)
-            mine = spec.get("runner") if spec.get("runner") in RUNNERS else runner
-            target["argv"], target["cwd"] = target_for(spec, env, "ruby" if mine == "ruby" else "rails")
-            if target["argv"] is None:
-                raise ConfigError('"runner": "ruby" needs "kamal" or "path", not "command"')
-            if mine == "auto" and "sidekiq" in backends:
-                target["fast"] = target_for(spec, env, "ruby")[0]
-        except (ConfigError, TypeError, ValueError) as e:
-            target["error"] = str(e)
-        envs.append(target)
+
+def build_target(project, env, spec, backends, runner):
+    """One environment of a project as the feed keeps it: how to reach it, or why not."""
+    asked = isinstance(spec, dict) and "fields" in spec
+    target = {"id": "%s/%s" % (project, env), "name": env, "error": "", "argv": None, "cwd": None, "fast": None,
+              # Of a Kamal deployment: what reaching it takes, as read and as it stands.
+              "found": spec["found"] if asked else {}, "fields": dict(spec["fields"]) if asked else {},
+              "missing": lacking(spec) if asked else [],
+              "dev": env == "development", "backends": backends or ["auto"],
+              # Anything else is unlocked from the panel, for a while; see Feed.unlock.
+              "writable": env == "development",
+              "production": env == "production" or (isinstance(spec, dict) and spec.get("production") is True)}
+    try:
+        if isinstance(spec, ConfigError):
+            raise spec
+        if asked:
+            spec = complete(spec)
+        mine = spec.get("runner") if spec.get("runner") in RUNNERS else runner
+        target["argv"], target["cwd"] = target_for(spec, env, "ruby" if mine == "ruby" else "rails")
+        if target["argv"] is None:
+            raise ConfigError('"runner": "ruby" needs "kamal" or "path", not "command"')
+        if mine == "auto" and "sidekiq" in backends:
+            target["fast"] = target_for(spec, env, "ruby")[0]
+    except (ConfigError, TypeError, ValueError) as e:
+        target["error"] = str(e)
+    return target
+
+
+def build_project(entry, path):
+    """One project: its backends and a target per environment."""
+    name = str(entry.get("name") or (os.path.basename(path) if path else "Project"))[:40]
+    wanted = entry.get("backends")
+    backends = [b for b in wanted if b in BACKENDS] if isinstance(wanted, list) else []
+    if not backends and path:
+        backends = backends_of(path)
+    runner = entry.get("runner") if entry.get("runner") in RUNNERS else "auto"
+    if runner == "auto" and path and redis_in_initializer(path):
+        runner = "rails"    # the light way would talk to the wrong Redis
+    specs = environment_specs(entry, path, str(entry["role"]) if entry.get("role") else "")
+    envs = [build_target(name, env, specs[env], backends, runner) for env in sorted(specs, key=env_order)]
     note = ""
     if not envs:
         note = ("Nothing to look at here: no Kamal config (config/deploy.yml) and no compose file. "
@@ -727,9 +732,9 @@ def compose(request, changing):
 
 
 def ask(target, request):
-    """Run the probe for one target; its answer, or { ok: False, error }.
+    """Send the script to one target; its answer, or { ok: False, error }.
 
-    "reached" tells whether the probe itself answered, as opposed to SSH,
+    "reached" tells whether the script itself answered, as opposed to SSH,
     docker or the application's boot failing before it could.
     """
     def failed(error, transport=False):

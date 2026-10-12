@@ -69,7 +69,7 @@ Panel {
     return fallback
   }
   readonly property string targetId: target ? target.id : ""
-  // Whether anything may be changed there at all; see "writable" in the config.
+  // Whether anything may be changed there now: development always, the rest while unlocked.
   readonly property bool writable: !!(target && target.writable)
   onTargetIdChanged: { resetView(); unlocking = null; if (!choosing) form = null; freshen() }
   // An environment that could not be looked at and now can is looked at.
@@ -411,6 +411,10 @@ Panel {
     return !!form && !form.values[field.key] && (!field.optional || form.need.indexOf(field.key) >= 0)
   }
   readonly property bool lacking: !!(target && target.missing && target.missing.length)
+  // What was read from a Kamal config may also be wrong for you (the SSH
+  // user, say): where such an environment does not answer, it can be put right.
+  readonly property bool amendable: !lacking && !!target && !target.loading && !!target.error
+                                    && !!target.fields && target.fields.host !== undefined
   function fillIn() {
     if (!target || !target.fields || !project) return
     var values = {}
@@ -869,11 +873,12 @@ Panel {
         }
 
         Button {
-          visible: root.lacking
-          text: "Fill in"
+          visible: root.lacking || root.amendable
+          text: root.lacking ? "Fill in" : "Edit connection"
           iconText: "\u{f03eb}" // nf-md-pencil
           iconSize: Style.font.icon
-          tooltipText: "Say what the Kamal config leaves to code; it is kept in the plugin's config"
+          tooltipText: root.lacking ? "Say what the Kamal config leaves to code; it is kept in the plugin's config"
+                                    : "Change how this environment is reached; what differs from the Kamal config is kept in the plugin's config"
           fontSize: Style.font.bodySmall
           foreground: root.barForeground
           fontFamily: root.ff
@@ -1121,7 +1126,9 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              text: "The project's Kamal config works some of this out with code, which is not run here. "
+              text: (root.form && root.form.need.length
+                     ? "The project's Kamal config works some of this out with code, which is not run here. "
+                     : "This is how the project's Kamal config says to reach it. ")
                   + "What you type is kept in the plugin's config."
               color: root.dimForeground
               font.family: root.ff
