@@ -276,8 +276,9 @@ Panel {
 
   readonly property var message: {
     var m = status.message
-    // Without an id it is about the list of projects, not one environment.
-    return m && m.text && (m.id === "" || (m.id === targetId && m.backend === backend)) ? m : null
+    // Without an id it is about the list of projects; with one, about that
+    // environment, and with a backend about a change made in it.
+    return m && m.text && (m.id === "" || (m.id === targetId && (m.backend === "" || m.backend === backend))) ? m : null
   }
 
   // A project that was just added is the one to look at.

@@ -993,7 +993,7 @@ class Feed:
             if not target or backend not in BACKENDS:
                 return
             if not target["writable"]:
-                self.say("%s is read-only; nothing was changed" % key.replace("/", " "), ok=False)
+                self.say("%s is read-only; nothing was changed" % key.replace("/", " "), ok=False, about=key)
                 return
             clean = {"op": op, "backend": backend}
             for arg in OPS[op]:
@@ -1006,10 +1006,10 @@ class Feed:
             return
         self.start(key, clean)
 
-    def say(self, text, ok=True, select="", env="", picked=None):
-        """Something to tell the panel that is not about one environment."""
+    def say(self, text, ok=True, select="", env="", picked=None, about=""):
+        """Something to tell the panel: about the list of projects, or `about` one environment."""
         with self.lock:
-            self.message = {"id": "", "backend": "", "ok": ok, "text": clip(text), "ts": int(time.time()),
+            self.message = {"id": about, "backend": "", "ok": ok, "text": clip(text), "ts": int(time.time()),
                             "select": select, "env": env, "picked": picked}
         self.emit()
 
@@ -1112,7 +1112,7 @@ class Feed:
             for k, (shape, what) in FIELDS.items():
                 values[k] = req[k].strip() if isinstance(req.get(k), str) else ""
                 if (values[k] or k not in OPTIONAL) and not shape.match(values[k]):
-                    self.say("%s: %s does not look right; nothing was saved" % (where, what), ok=False)
+                    self.say("%s: %s does not look right; nothing was saved" % (where, what), ok=False, about=key)
                     return
             raw = read_raw()
             entry = next((e for e in raw["projects"] if isinstance(e, dict) and isinstance(e.get("path"), str)
@@ -1135,7 +1135,7 @@ class Feed:
             self.say("Could not save: %s" % e, ok=False)
             return
         self.reload()
-        self.say("%s: saved" % where)
+        self.say("%s: saved" % where, about=key)
         self.start(key)
 
     def unlock(self, key, typed):
@@ -1152,16 +1152,16 @@ class Feed:
                 self.settle()
         where = key.replace("/", " ")
         if refused:
-            self.say("%s stays read-only: its name was not typed" % where, ok=False)
+            self.say("%s stays read-only: its name was not typed" % where, ok=False, about=key)
         else:
-            self.say("%s: changes are allowed for %d minutes" % (where, UNLOCK // 60))
+            self.say("%s: changes are allowed for %d minutes" % (where, UNLOCK // 60), about=key)
 
     def lock_again(self, key):
         with self.lock:
             had = self.unlocked.pop(key, None)
             self.settle()
         if had:
-            self.say("%s: read-only again" % key.replace("/", " "))
+            self.say("%s: read-only again" % key.replace("/", " "), about=key)
 
     def serve(self):
         self.serving = True
